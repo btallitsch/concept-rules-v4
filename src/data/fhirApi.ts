@@ -1,20 +1,78 @@
 import type { FhirBundle, FhirValueSet } from "../types/fhir";
 import type { ConceptRuleForm, QueryResult, ResultRecordDetail } from "../types/domain";
-import { mockValueSetBundle, mockMedicationResults } from "./mockFhirBundle";
+import { mockValueSetBundle } from "./mockFhirBundle";
 
-const SIMULATED_LATENCY_MS = 600;
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// ─── JSON data source ─────────────────────────────────────────────────────────
+// Place your JSON file at:  /public/data/medications.json
+// It will be served at:     /data/medications.json  (Vite static asset)
+//
+// Supported shapes:
+//   [{ "id": "...", "name": "..." }]     ← bare array
+//   { "data": [...] }                    ← data envelope
+//   { "entry": [...] }                   ← FHIR-style envelope
+//   { "results": [...] }                 ← results envelope
+
+const JSON_URL = "/data/medications.json";
+
+// Module-level cache — file is fetched once per browser session
+let recordCache: ResultRecordDetail[] | null = null;
 
 /**
- * Fetch ValueSet bundle.
- * Swap: GET [base]/ValueSet?status=active&_count=50
+ * Maps a raw JSON object to ResultRecordDetail.
+ * Adjust field names here if your JSON uses different keys.
  */
-export async function fetchValueSetBundle(): Promise<FhirBundle<FhirValueSet>> {
-  await delay(SIMULATED_LATENCY_MS);
-  return mockValueSetBundle;
+function mapJsonRecord(raw: Record<string, unknown>): ResultRecordDetail {
+  return {
+    id:         String(raw["id"]         ?? raw["ID"]          ?? crypto.randomUUID()),
+    name:       String(raw["name"]       ?? raw["Name"]        ?? raw["medicationName"] ?? ""),
+    codes:      String(raw["codes"]      ?? raw["code"]        ?? raw["rxcui"]          ?? ""),
+    adminRoute: String(raw["adminRoute"] ?? raw["admin_route"] ?? raw["route"]          ?? ""),
+    frequency:  String(raw["frequency"]  ?? raw["Frequency"]   ?? raw["timing"]         ?? ""),
+    status:     String(raw["status"]     ?? raw["Status"]      ?? "unknown"),
+    // Optional enrichment fields — present only if your JSON includes them
+    drugClass:         raw["drugClass"]         != null ? String(raw["drugClass"])                            : undefined,
+    rxcui:             raw["rxcui"]             != null ? String(raw["rxcui"])                                : undefined,
+    brandNames:        Array.isArray(raw["brandNames"])        ? (raw["brandNames"] as string[])             : undefined,
+    mechanism:         raw["mechanism"]         != null ? String(raw["mechanism"])                            : undefined,
+    indications:       Array.isArray(raw["indications"])       ? (raw["indications"] as string[])            : undefined,
+    contraindications: Array.isArray(raw["contraindications"]) ? (raw["contraindications"] as string[])      : undefined,
+    sideEffects:       Array.isArray(raw["sideEffects"])       ? (raw["sideEffects"] as string[])            : undefined,
+    loincCode:         raw["loincCode"]         != null ? String(raw["loincCode"])                            : undefined,
+    snomedCode:        raw["snomedCode"]        != null ? String(raw["snomedCode"])                           : undefined,
+    lastUpdated:       raw["lastUpdated"]        != null ? String(raw["lastUpdated"])                         : undefined,
+    source:            raw["source"]             != null ? String(raw["source"])                              : undefined,
+  };
 }
+
+async function loadRecords(): Promise<ResultRecordDetail[]> {
+  if (recordCache) return recordCache;
+
+  const response = await fetch(JSON_URL);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to load ${JSON_URL}: ${response.status} ${response.statusText}`
+    );
+  }
+
+  const json: unknown = await response.json();
+
+  // Unwrap common envelope shapes
+  const raw: unknown[] = Array.isArray(json)
+    ? json
+    : Array.isArray((json as Record<string, unknown>)?.["data"])    ? (json as Record<string, unknown[]>)["data"]
+    : Array.isArray((json as Record<string, unknown>)?.["entry"])   ? (json as Record<string, unknown[]>)["entry"]
+    : Array.isArray((json as Record<string, unknown>)?.["results"]) ? (json as Record<string, unknown[]>)["results"]
+    : [];
+
+  if (raw.length === 0) {
+    console.warn(`[fhirApi] No records found in ${JSON_URL}. Check the JSON shape.`);
+  }
+
+  recordCache = raw.map((item) => mapJsonRecord(item as Record<string, unknown>));
+  return recordCache;
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
 
 export interface QueryParams {
   page: number;
@@ -33,19 +91,34 @@ export interface PagedQueryResult extends Omit<QueryResult, "records"> {
 }
 
 /**
- * Execute a concept query with server-side pagination, search, and sort.
- * Swap: POST [base]/$evaluate-concept-rules with FHIR Parameters resource.
+ * Fetch ValueSet bundle.
+ * Swap: GET [base]/ValueSet?status=active&_count=50
+ */
+export async function fetchValueSetBundle(): Promise<FhirBundle<FhirValueSet>> {
+  return mockValueSetBundle;
+}
+
+/**
+ * Execute a concept query with client-side pagination, search, and sort
+ * over the JSON file loaded from /public/data/medications.json.
+ *
+ * To swap to a real FHIR server:
+ *   Replace loadRecords() with a fetch to your FHIR endpoint and return
+ *   the server's paged response directly.
  */
 export async function executeConceptQuery(
   _form: ConceptRuleForm,
   params: QueryParams
 ): Promise<PagedQueryResult> {
-  await delay(SIMULATED_LATENCY_MS);
+  const {
+    page, pageSize,
+    search = "", status = "all",
+    sortKey = "id", sortDir = "asc",
+  } = params;
 
-  const { page, pageSize, search = "", status = "all", sortKey = "id", sortDir = "asc" } = params;
+  const allRecords = await loadRecords();
 
-  // Simulate server-side filter + sort
-  let records = [...mockMedicationResults];
+  let records = [...allRecords];
 
   if (status !== "all") {
     records = records.filter((r) => r.status === status);
@@ -71,10 +144,9 @@ export async function executeConceptQuery(
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(page, pageCount);
   const start = (safePage - 1) * pageSize;
-  const paged = records.slice(start, start + pageSize);
 
   return {
-    records: paged,
+    records: records.slice(start, start + pageSize),
     totalCount: total,
     executedAt: new Date().toISOString(),
     page: safePage,
@@ -84,31 +156,37 @@ export async function executeConceptQuery(
 }
 
 /**
- * Fetch a single record by ID.
+ * Fetch a single record by ID from the loaded JSON.
  * Swap: GET [base]/MedicationRequest/[id]
  */
-export async function fetchRecordDetail(id: string): Promise<ResultRecordDetail | null> {
-  await delay(400);
-  return mockMedicationResults.find((r) => r.id === id) ?? null;
+export async function fetchRecordDetail(
+  id: string
+): Promise<ResultRecordDetail | null> {
+  const records = await loadRecords();
+  return records.find((r) => r.id === id) ?? null;
 }
 
 /**
- * Fetch dashboard summary metrics.
+ * Derive dashboard metrics from the loaded JSON.
  * Swap: GET [base]/$concept-summary
  */
 export async function fetchDashboardMetrics() {
-  await delay(400);
-  const total = mockMedicationResults.length;
-  const active = mockMedicationResults.filter((r) => r.status === "active").length;
-  const vasopressors = mockMedicationResults.filter((r) => r.drugClass === "Vasopressor").length;
+  const records = await loadRecords();
+  const total     = records.length;
+  const active    = records.filter((r) => r.status === "active").length;
   return {
-    totalRecords: total,
-    activeRecords: active,
-    vasopressors,
-    vasodilators: mockMedicationResults.filter((r) => r.drugClass === "Vasodilator").length,
-    inotropes: mockMedicationResults.filter((r) => r.drugClass === "Inotrope").length,
-    valueSets: 11,
-    lastRun: new Date().toISOString(),
-    completionRate: Math.round((active / total) * 100),
+    totalRecords:    total,
+    activeRecords:   active,
+    vasopressors:    records.filter((r) => r.drugClass === "Vasopressor").length,
+    vasodilators:    records.filter((r) => r.drugClass === "Vasodilator").length,
+    inotropes:       records.filter((r) => r.drugClass === "Inotrope").length,
+    valueSets:       11,
+    lastRun:         new Date().toISOString(),
+    completionRate:  total > 0 ? Math.round((active / total) * 100) : 0,
   };
+}
+
+/** Clear the record cache — useful for hot-reloading during development. */
+export function clearRecordCache(): void {
+  recordCache = null;
 }
